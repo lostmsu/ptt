@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/repo/">
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="src/ptt/ptt.csproj" />
+</Solution>
