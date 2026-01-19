@@ -126,6 +126,23 @@ static int RunList(TorchCheckpoint checkpoint, string path, Args parsed) {
         list.Add(i);
     }
 
+    var nameCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+    for (int i = 0; i < rows.Count; i++) {
+        string name = rows[i].Name;
+        if (nameCounts.TryGetValue(name, out int count)) {
+            nameCounts[name] = count + 1;
+        } else {
+            nameCounts[name] = 1;
+        }
+    }
+
+    for (int i = 0; i < rows.Count; i++) {
+        ListRow row = rows[i];
+        if (nameCounts.TryGetValue(row.Name, out int count) && count > 1 && row.Name.IndexOf('.') < 0) {
+            row.Name = "s" + row.Tensor.Storage.Key + "." + row.Name;
+        }
+    }
+
     int nameWidth = MaxLen(rows, static r => r.Name) + 1;
     int dtypeWidth = Math.Max(MaxLen(rows, static r => r.DType), "dtype".Length) + 1;
     int shapeWidth = Math.Max(MaxLen(rows, static r => r.Shape), "shape".Length) + 1;
@@ -356,7 +373,7 @@ internal sealed class ListRow {
     }
 
     public TorchTensor Tensor { get; }
-    public string Name { get; init; } = "";
+    public string Name { get; set; } = "";
     public string DType { get; init; } = "";
     public string Shape { get; init; } = "";
     public TensorStats Stats { get; set; }
