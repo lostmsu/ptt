@@ -10,3 +10,11 @@ name                  dtype shape     mean       std       min       max    mina
 Tensors: 521
 OK: all floating-point tensors are finite. Checked 27644964 element(s).
 ```
+
+## Installation
+
+Use https://gitcho.co to install the package:
+
+```pwsh
+choco install gh.lostmsu.ptt
+```
