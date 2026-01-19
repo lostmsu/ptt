@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.IO.MemoryMappedFiles;
 
 using PyTorchCheckpoint;
@@ -10,6 +11,9 @@ const int ExitNonFinite = 3;
 
 
 try {
+    CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+    CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
+
     var parsed = Args.Parse(args);
     if (parsed.Error is not null) {
         Console.Error.WriteLine(parsed.Error);
@@ -103,30 +107,73 @@ static int RunList(TorchCheckpoint checkpoint, string path, Args parsed) {
     Console.WriteLine($"Loaded checkpoint: {path}");
     Console.WriteLine($"Tensors: {checkpoint.Tensors.Count}");
 
-    var tensorsByStorageKey = new Dictionary<string, List<TorchTensor>>(StringComparer.Ordinal);
-    foreach (var tensor in checkpoint.Tensors) {
-        if (!tensorsByStorageKey.TryGetValue(tensor.Storage.Key, out var list)) {
+    var rows = new List<ListRow>(checkpoint.Tensors.Count);
+    var rowsByStorageKey = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+
+    for (int i = 0; i < checkpoint.Tensors.Count; i++) {
+        TorchTensor tensor = checkpoint.Tensors[i];
+        var row = new ListRow(tensor) {
+            Name = tensor.Name ?? "<unnamed>",
+            DType = tensor.Storage.ScalarType.ToDisplayString(),
+            Shape = FormatShape(tensor.Sizes),
+        };
+        rows.Add(row);
+
+        if (!rowsByStorageKey.TryGetValue(tensor.Storage.Key, out var list)) {
             list = [];
-            tensorsByStorageKey[tensor.Storage.Key] = list;
+            rowsByStorageKey[tensor.Storage.Key] = list;
         }
-        list.Add(tensor);
+        list.Add(i);
     }
 
-    Console.WriteLine("name\tdtype\tshape\tmin\tmax\tminabs\tmean\tstd\tnonfinite");
+    int nameWidth = MaxLen(rows, static r => r.Name) + 1;
+    int dtypeWidth = Math.Max(MaxLen(rows, static r => r.DType), "dtype".Length) + 1;
+    int shapeWidth = Math.Max(MaxLen(rows, static r => r.Shape), "shape".Length) + 1;
 
-    foreach (var kvp in tensorsByStorageKey) {
-        var tensors = kvp.Value;
-        var storage = tensors[0].Storage;
+    const int NumericContentWidth = 9;
+    const int NumericColumnWidth = 10;
 
-        for (int i = 0; i < tensors.Count; i++) {
-            TensorScanner.ValidateTensorStorageRange(tensors[i]);
+    Console.WriteLine(FormatHeader(nameWidth, dtypeWidth, shapeWidth, NumericColumnWidth));
+
+    foreach (var kvp in rowsByStorageKey) {
+        List<int> rowIndices = kvp.Value;
+        TorchStorage storage = rows[rowIndices[0]].Tensor.Storage;
+
+        for (int i = 0; i < rowIndices.Count; i++) {
+            TensorScanner.ValidateTensorStorageRange(rows[rowIndices[i]].Tensor);
         }
 
         using var storageData = StorageData.Open(checkpoint, storage, parsed.UseMemoryMappedFiles);
-        foreach (var tensor in tensors) {
-            var stats = TensorScanner.ComputeStats(storageData, checkpoint.IsLittleEndian, tensor);
-            Console.WriteLine($"{tensor.Name ?? "<unnamed>"}\t{tensor.Storage.ScalarType.ToDisplayString()}\t{FormatShape(tensor.Sizes)}\t{FormatNum(stats.Min)}\t{FormatNum(stats.Max)}\t{FormatNum(stats.MinAbs)}\t{FormatNum(stats.Mean)}\t{FormatNum(stats.Std)}\t{stats.NonFiniteCount.ToString(CultureInfo.InvariantCulture)}");
+        for (int i = 0; i < rowIndices.Count; i++) {
+            ListRow row = rows[rowIndices[i]];
+            row.Stats = TensorScanner.ComputeStats(storageData, checkpoint.IsLittleEndian, row.Tensor);
         }
+    }
+
+    var sb = new StringBuilder(capacity: 256);
+    for (int i = 0; i < rows.Count; i++) {
+        sb.Clear();
+        ListRow row = rows[i];
+
+        AppendTextColumn(sb, row.Name, nameWidth);
+        AppendTextColumn(sb, row.DType, dtypeWidth);
+        AppendTextColumn(sb, row.Shape, shapeWidth);
+
+        if (row.Tensor.Numel == 1) {
+            AppendNumberColumn(sb, row.Stats.Mean, NumericContentWidth, NumericColumnWidth);
+            AppendBlankColumn(sb, NumericColumnWidth);
+            AppendBlankColumn(sb, NumericColumnWidth);
+            AppendBlankColumn(sb, NumericColumnWidth);
+            AppendBlankColumn(sb, NumericColumnWidth);
+        } else {
+            AppendNumberColumn(sb, row.Stats.Mean, NumericContentWidth, NumericColumnWidth);
+            AppendNumberColumn(sb, row.Stats.Std, NumericContentWidth, NumericColumnWidth);
+            AppendNumberColumn(sb, row.Stats.Min, NumericContentWidth, NumericColumnWidth);
+            AppendNumberColumn(sb, row.Stats.Max, NumericContentWidth, NumericColumnWidth);
+            AppendNumberColumn(sb, row.Stats.MinAbs, NumericContentWidth, NumericColumnWidth);
+        }
+
+        Console.WriteLine(sb.ToString());
     }
 
     return ExitOk;
@@ -148,11 +195,139 @@ static string FormatShape(IReadOnlyList<long> sizes) {
     return "[" + string.Join(",", parts) + "]";
 }
 
-static string FormatNum(double v) {
-    if (double.IsNaN(v)) return "nan";
-    if (double.IsPositiveInfinity(v)) return "+inf";
-    if (double.IsNegativeInfinity(v)) return "-inf";
-    return v.ToString("G17", CultureInfo.InvariantCulture);
+static string FormatHeader(int nameWidth, int dtypeWidth, int shapeWidth, int numericWidth) {
+    var sb = new StringBuilder(capacity: 128);
+
+    AppendTextColumn(sb, "name", nameWidth);
+    AppendTextColumn(sb, "dtype", dtypeWidth);
+    AppendTextColumn(sb, "shape", shapeWidth);
+
+    AppendTextColumn(sb, "mean", numericWidth, rightAlign: true);
+    AppendTextColumn(sb, "std", numericWidth, rightAlign: true);
+    AppendTextColumn(sb, "min", numericWidth, rightAlign: true);
+    AppendTextColumn(sb, "max", numericWidth, rightAlign: true);
+    AppendTextColumn(sb, "minabs", numericWidth, rightAlign: true);
+
+    return sb.ToString();
+}
+
+static void AppendBlankColumn(StringBuilder sb, int columnWidth) {
+    if (columnWidth < 1) throw new ArgumentOutOfRangeException(nameof(columnWidth));
+    sb.Append(' ', columnWidth);
+}
+
+static void AppendTextColumn(StringBuilder sb, string text, int width, bool rightAlign = false) {
+    if (width < 1) throw new ArgumentOutOfRangeException(nameof(width));
+
+    string value = text ?? "";
+    if (value.Length > width - 1) {
+        value = value.Substring(0, width - 1);
+    }
+
+    if (rightAlign) {
+        sb.Append(value.PadLeft(width - 1));
+    } else {
+        sb.Append(value.PadRight(width - 1));
+    }
+    sb.Append(' ');
+}
+
+static void AppendNumberColumn(StringBuilder sb, double value, int contentWidth, int columnWidth) {
+    if (contentWidth < 1) throw new ArgumentOutOfRangeException(nameof(contentWidth));
+    if (columnWidth < contentWidth + 1) throw new ArgumentOutOfRangeException(nameof(columnWidth));
+
+    string s = FormatNumber(value, contentWidth);
+    if (s.Length > contentWidth) s = OverflowPlaceholder(contentWidth);
+
+    sb.Append(s.PadLeft(contentWidth));
+    sb.Append(' ', columnWidth - contentWidth);
+}
+
+static string FormatNumber(double value, int maxWidth) {
+    if (maxWidth < 1) throw new ArgumentOutOfRangeException(nameof(maxWidth));
+
+    if (double.IsNaN(value)) return maxWidth >= 3 ? "nan" : OverflowPlaceholder(maxWidth);
+    if (double.IsPositiveInfinity(value)) return maxWidth >= 4 ? "+inf" : OverflowPlaceholder(maxWidth);
+    if (double.IsNegativeInfinity(value)) return maxWidth >= 4 ? "-inf" : OverflowPlaceholder(maxWidth);
+    if (value == 0) return "0";
+
+    double abs = Math.Abs(value);
+
+    bool preferScientific = abs >= 1e6 || abs < 1e-3;
+    if (!preferScientific) {
+        string fixedS = FormatFixedForWidth(value, maxWidth, maxFractionDigits: 4);
+        if (fixedS.Length <= maxWidth) return fixedS;
+    }
+
+    string sciS = FormatScientificForWidth(value, maxWidth, maxMantissaDecimals: 3);
+    if (sciS.Length <= maxWidth) return sciS;
+
+    string fixedFallback = FormatFixedForWidth(value, maxWidth, maxFractionDigits: 0);
+    if (fixedFallback.Length <= maxWidth) return fixedFallback;
+
+    return OverflowPlaceholder(maxWidth);
+}
+
+static string FormatFixedForWidth(double value, int maxWidth, int maxFractionDigits) {
+    if (maxWidth < 1) return OverflowPlaceholder(maxWidth);
+
+    string sign = value < 0 ? "-" : "";
+    double abs = Math.Abs(value);
+
+    int intDigits;
+    if (abs >= 1) {
+        intDigits = (int)Math.Floor(Math.Log10(abs)) + 1;
+    } else {
+        intDigits = 1; // "0"
+    }
+
+    int baseLen = sign.Length + intDigits;
+    if (baseLen > maxWidth) {
+        return OverflowPlaceholder(maxWidth);
+    }
+
+    int decimalsByWidth = maxWidth - baseLen - 1; // minus '.'
+    if (decimalsByWidth <= 0) {
+        return value.ToString("0", CultureInfo.InvariantCulture);
+    }
+
+    int decimals = Math.Min(maxFractionDigits, decimalsByWidth);
+    string fmt = "0." + new string('#', decimals);
+    return value.ToString(fmt, CultureInfo.InvariantCulture);
+}
+
+static string FormatScientificForWidth(double value, int maxWidth, int maxMantissaDecimals) {
+    if (maxWidth < 1) return OverflowPlaceholder(maxWidth);
+
+    string sign = value < 0 ? "-" : "";
+    double abs = Math.Abs(value);
+    if (abs == 0) return "0";
+
+    int exp10 = (int)Math.Floor(Math.Log10(abs));
+    double mantissa = abs / Math.Pow(10, exp10);
+
+    string expStr = exp10 >= 0 ? "+" + exp10.ToString(CultureInfo.InvariantCulture) : exp10.ToString(CultureInfo.InvariantCulture);
+
+    int baseLen = sign.Length + 1 /*digit*/ + 1 /*E*/ + expStr.Length;
+    if (baseLen > maxWidth) return OverflowPlaceholder(maxWidth);
+
+    int decimalsByWidth = maxWidth - baseLen - 1; // '.'
+    int decimals = Math.Max(0, Math.Min(maxMantissaDecimals, decimalsByWidth));
+
+    string mantissaFmt = decimals == 0 ? "0" : "0." + new string('#', decimals);
+    string mantissaStr = mantissa.ToString(mantissaFmt, CultureInfo.InvariantCulture);
+    return sign + mantissaStr + "E" + expStr;
+}
+
+static string OverflowPlaceholder(int width) => new('*', width);
+
+static int MaxLen(List<ListRow> rows, Func<ListRow, string> selector) {
+    int max = 0;
+    for (int i = 0; i < rows.Count; i++) {
+        int len = selector(rows[i]).Length;
+        if (len > max) max = len;
+    }
+    return max;
 }
 
 static void PrintUsage() {
@@ -173,6 +348,18 @@ internal enum Command {
     Unknown = 0,
     CheckFinite,
     List,
+}
+
+internal sealed class ListRow {
+    public ListRow(TorchTensor tensor) {
+        this.Tensor = tensor ?? throw new ArgumentNullException(nameof(tensor));
+    }
+
+    public TorchTensor Tensor { get; }
+    public string Name { get; init; } = "";
+    public string DType { get; init; } = "";
+    public string Shape { get; init; } = "";
+    public TensorStats Stats { get; set; }
 }
 
 internal sealed class Args {
